@@ -32,6 +32,8 @@ HEADERS = { "Authorization": AUTH_TOKEN }
 
 ENDPOINT_TEMPLATE_OPTIONS = ['courseId', 'cluster', 'clusterKey', 'activityId', 'questionId', 'userQuestionId']
 
+VALID_ANSWER_PERCENTAGE_THRESHOLD = 60
+
 
 class StoppableThread(threading.Thread):
     """Thread class with a stop() method. The thread itself has to check
@@ -47,21 +49,47 @@ class StoppableThread(threading.Thread):
     def stopped(self):
         return self._stop_event.is_set()
 
+def answer_type_to_key(answerType: str) -> str | None:
+    match(answerType):
+        case "SINGLE_ANSWER":
+            return "answer"
+        case "MULTIPLE_ANSWER":
+            return "answers"
+    return None
+
+def add_default_answer(data, answer_key):
+        match(answer_key):
+            case "answer":
+                data[answer_key] = "A"
+            case "answers":
+                data[answer_key] = ["A"]
+        return data
+
 class QuestionThread(StoppableThread):
-    def __init__(self, course_id, activity_id, question_id):
+    def __init__(self, course_id, activity_id, question_id, answer_type="SINGLE_ANSWER"):
         super().__init__()
         self.course_id = course_id
         self.activity_id = activity_id
         self.question_id = question_id
+        self.answer_type = answer_type
 
     def run(self):
-        asyncio.run(self.handle_question(self.course_id, self.activity_id, self.question_id))
+        asyncio.run(self.handle_question(self.course_id, self.activity_id, self.question_id, self.answer_type))
 
-    async def handle_question(self, course_id, activity_id, question_id):
+    async def handle_question(self, course_id, activity_id, question_id, answer_type):
         """async function to handle a question. Continuously updates answer."""
         print("Answering question...")
+
         post_answer_endpoint = generate_endpoint(POST_ANSWER_ENDPOINT_TEMPLATE, options={ "activityId": activity_id, "questionId": question_id })
-        post_json_data = { "answer": "a","userId": USER_ID, "activityId": activity_id, "questionId": question_id, "clientType": "WEB" }
+        post_json_data = { "userId": USER_ID, "activityId": activity_id, "questionId": question_id, "clientType": "WEB" }
+
+        # handle different requests for different question types
+        answer_key = answer_type_to_key(answer_type)
+        if answer_key == None:
+            print("invalid or unanswerable answer type")
+            return
+
+        post_json_data = add_default_answer(post_json_data, answer_key)
 
         # answer automatically
         post_answer = requests.post(post_answer_endpoint, json=post_json_data, headers=HEADERS)
@@ -72,7 +100,8 @@ class QuestionThread(StoppableThread):
 
         user_question_id = post_answer.json()['userQuestionId']
         put_answer_endpoint = generate_endpoint(PUT_ANSWER_ENDPOINT_TEMPLATE, options={ "activityId": activity_id, "questionId": question_id, "userQuestionId": user_question_id })
-        put_json_data = { "answer": "a","userId": USER_ID, "activityId": activity_id, "userQuestionId": user_question_id }
+        put_json_data = { "userId": USER_ID, "activityId": activity_id, "userQuestionId": user_question_id }
+        put_json_data = add_default_answer(put_json_data, answer_key)
 
         while not self.stopped():
             await asyncio.sleep(1)
@@ -85,14 +114,29 @@ class QuestionThread(StoppableThread):
             question_answers = get_questions.json()['questions'][-1]['answerOverview']
 
             best_answer = question_answers[0];
-            for question in question_answers:
-                if question['count'] > best_answer['count']:
-                    best_answer = question
+            valid_answers = [];
 
-            if (put_json_data['answer'] == best_answer['answer'].lower()):
-                continue
+            for answer in question_answers:
+                if answer['count'] > best_answer['count']:
+                    best_answer = answer
+                if answer['percentageOfTotalResponses'] > VALID_ANSWER_PERCENTAGE_THRESHOLD:
+                    valid_answers.append(answer['answer'])
 
-            put_json_data['answer'] = best_answer['answer'].lower()
+            match(answer_key):
+                case "answer":
+                    if (put_json_data['answer'] == best_answer['answer']):
+                        continue
+
+                    print(f"changing answer to {best_answer['answer']}...")
+                    put_json_data[answer_key] = best_answer['answer']
+
+                case "answers":
+                    if (put_json_data['answers'] == valid_answers):
+                        continue
+
+                    print(f"changing answer to {valid_answers}...")
+                    put_json_data[answer_key] = valid_answers
+
 
             put_answer = requests.put(put_answer_endpoint, json=put_json_data, headers=HEADERS)
             print("change answer response: " + str(put_answer))
@@ -159,8 +203,9 @@ async def main(course_id):
                     print("-- QUESTION STARTED --")
                     activity_id = msg['data']['activityId']
                     question_id = msg['data']['questionId']
+                    answer_type = msg['data']['answerType']
                     # question_handler_thread = StoppableThread(target=asyncio.run, args=(handle_question(activity_id, question_id),))
-                    question_handler_thread = QuestionThread(course_id, activity_id, question_id)
+                    question_handler_thread = QuestionThread(course_id, activity_id, question_id, answer_type)
 
                     question_handler_thread.start()
                 case "endQuestion":
