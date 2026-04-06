@@ -282,7 +282,8 @@ async def main():
     
     course_ids = []
     for enrollment in get_courses.json()['enrollments']:
-        course_ids.append(enrollment['courseId'])
+        if enrollment['archived'] == None:
+            course_ids.append(enrollment['courseId'])
     print(f"course ids: {course_ids}")
 
     for course_id in course_ids:
