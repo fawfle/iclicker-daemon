@@ -9,7 +9,9 @@ SETTINGS = json.load(open("settings.json"))
 
 API_URL = "https://api.iclicker.com"
 
-COURSE_STATUS_ENDPOINT = API_URL + "/student/course/status"
+PROFILE_ENDPOINT = API_URL + "/trogon/v4/profile"
+COURSES_ENDPOINT = API_URL + "/v1/users/{userId}/views/student-courses"
+CLASS_SECTIONS_ENDPOINT = API_URL + "/v2/courses/{courseId}/class-sections?recordsPerPage=1&pageNumber=1&expandChild=activities&expandChild=userActivities&expandChild=attendances&expandChild=questions&expandChild=userQuestions&expandChild=questionGroups&userId={userId}"
 
 JOIN_CLASS_ENDPOINT_TEMPLATE = API_URL + "/trogon/v2/course/attendance/join/{courseId}"
 
@@ -24,16 +26,19 @@ PUT_ANSWER_ENDPOINT_TEMPLATE = API_URL + "/v2/activities/{activityId}/questions/
 
 GET_QUESTIONS_ENDPOINT_TEMPLATE = API_URL + "/v2/reporting/courses/{courseId}/activities/{activityId}/questions/view"
 
-USER_ID = SETTINGS['userId']
 COURSE_ID = SETTINGS['courseId']
 AUTH_TOKEN = SETTINGS['authToken']
+# initially unset. Get's pulled from server
+USER_ID = None
 
 HEADERS = { "Authorization": AUTH_TOKEN }
 
-ENDPOINT_TEMPLATE_OPTIONS = ['courseId', 'cluster', 'clusterKey', 'activityId', 'questionId', 'userQuestionId']
+ENDPOINT_TEMPLATE_OPTIONS = ['courseId', 'cluster', 'clusterKey', 'activityId', 'questionId', 'userQuestionId', 'userId']
 
 VALID_ANSWER_PERCENTAGE_THRESHOLD = 60
 
+def format_print(course_id, message):
+    print(f"[{course_id[:5]}] {message}")
 
 class StoppableThread(threading.Thread):
     """Thread class with a stop() method. The thread itself has to check
@@ -78,7 +83,7 @@ class QuestionThread(StoppableThread):
 
     async def handle_question(self, course_id, activity_id, question_id, answer_type):
         """async function to handle a question. Continuously updates answer."""
-        print("Answering question...")
+        format_print(course_id, "Answering question...")
 
         post_answer_endpoint = generate_endpoint(POST_ANSWER_ENDPOINT_TEMPLATE, options={ "activityId": activity_id, "questionId": question_id })
         post_json_data = { "userId": USER_ID, "activityId": activity_id, "questionId": question_id, "clientType": "WEB" }
@@ -86,17 +91,22 @@ class QuestionThread(StoppableThread):
         # handle different requests for different question types
         answer_key = answer_type_to_key(answer_type)
         if answer_key == None:
-            print("invalid or unanswerable answer type")
+            format_print(course_id, "invalid or unanswerable answer type")
             return
 
         post_json_data = add_default_answer(post_json_data, answer_key)
 
         # answer automatically
         post_answer = requests.post(post_answer_endpoint, json=post_json_data, headers=HEADERS)
-        print("answer question response: " + str(post_answer))
         if post_answer.status_code != 200:
-            print("ERROR: answer_question status code is " + str(post_answer.status_code))
+            if post_answer.status_code == 409:
+                format_print(course_id, "WARNING: answer_question status code is 409. It's likely that the question has already been answered.")
+            else:
+                format_print(course_id, "ERROR: answer_question status code is " + str(post_answer.status_code))
+            format_print(course_id, "Stopping question handler (wouldn't have userQuestionId)...")
             return
+        else:
+            format_print(course_id, "Successfully answered question.")
 
         user_question_id = post_answer.json()['userQuestionId']
         put_answer_endpoint = generate_endpoint(PUT_ANSWER_ENDPOINT_TEMPLATE, options={ "activityId": activity_id, "questionId": question_id, "userQuestionId": user_question_id })
@@ -110,7 +120,7 @@ class QuestionThread(StoppableThread):
 
             # get most popular answer
             get_questions = requests.get(generate_endpoint(GET_QUESTIONS_ENDPOINT_TEMPLATE, options={ "courseId": course_id, "activityId": activity_id }), headers=HEADERS)
-            print("get questions response: " + str(get_questions))
+            format_print(course_id, "get questions response: " + str(get_questions))
             question_answers = get_questions.json()['questions'][-1]['answerOverview']
 
             best_answer = question_answers[0];
@@ -127,14 +137,14 @@ class QuestionThread(StoppableThread):
                     if (put_json_data['answer'] == best_answer['answer']):
                         continue
 
-                    print(f"changing answer to {best_answer['answer']}...")
+                    format_print(course_id, f"changing answer to {best_answer['answer']}...")
                     put_json_data[answer_key] = best_answer['answer']
 
                 case "answers":
                     if (put_json_data['answers'] == valid_answers):
                         continue
 
-                    print(f"changing answer to {valid_answers}...")
+                    format_print(course_id, f"changing answer to {valid_answers}...")
                     put_json_data[answer_key] = valid_answers
 
 
@@ -165,58 +175,89 @@ def load_json_string(json_string):
 
 def join_class(course_id):
     """attempts to join the class with the given course_id"""
-    print("Attempting to join course...")
+    format_print(course_id, f"Attempting to join course ({course_id})...")
     join_course = requests.post(generate_endpoint(JOIN_CLASS_ENDPOINT_TEMPLATE, options={ "courseId": course_id}), headers=HEADERS)
-    print("join course response: " + str(join_course))
+    format_print(course_id, "join course response: " + str(join_course))
+    return join_course.status_code
 
-async def main(course_id):
+async def handle_course(course_id):
     # try joining at the start just in case class has already started.
-    join_class(course_id);
+    join_class_status = join_class(course_id);
 
-    pusher_cluster = requests.get(GET_PUSHER_CLUSTER_ENDPOINT, headers=HEADERS)
-    print("pusher cluster response: " + str(pusher_cluster))
-    cluster = pusher_cluster.json()["cluster"]
-    cluster_key = pusher_cluster.json()["key"]
+    get_pusher_cluster = requests.get(GET_PUSHER_CLUSTER_ENDPOINT, headers=HEADERS)
+    format_print(course_id, "get pusher cluster response: " + str(get_pusher_cluster))
+    cluster = get_pusher_cluster.json()["cluster"]
+    cluster_key = get_pusher_cluster.json()["key"]
 
+    format_print(course_id, "Connecting to websocket...")
     with connect(generate_endpoint(PUSHER_ENDPOINT_TEMPLATE, options={ "cluster": cluster, "clusterKey": cluster_key })) as websocket:
         connect_message = load_json_string(websocket.recv())
         # print(json.dumps(connect_message, indent=4))
 
         # authenticate pusher channel
         pusher_channel = requests.post(AUTHENTICATE_PUSHER_CHANNEL_ENDPOINT, data={"socket_id": connect_message['data']['socket_id'], "channel_name": f"private-{course_id}" }, headers=HEADERS)
-        print(f"pusher channel response: {pusher_channel}")
+
+        if pusher_channel.status_code == 200:
+            format_print(course_id, "Successfully connected to pusher channel")
+        else:
+            format_print(course_id, f"ERROR: unexpected pusher_channel response: {pusher_channel}")
+
         channel_auth_token = pusher_channel.json()['auth']
 
         websocket.send(f'{{"event":"pusher:subscribe","data":{{"auth":"{channel_auth_token}","channel":"private-{course_id}"}}}}')
 
         question_handler_thread = None
 
+        # attempt to join current activity if the class is already active.
+        if join_class_status == 200:
+            get_classes = requests.get(generate_endpoint(CLASS_SECTIONS_ENDPOINT, options={ "courseId": course_id, "userId": USER_ID }), headers=HEADERS)
+            most_recent_question = get_classes.json()[0]['activities'][-1]['questions'][-1]
+
+            question_handler_thread = QuestionThread(course_id, most_recent_question['activityId'], most_recent_question['_id'], most_recent_question['answerType'])
+            question_handler_thread.start()
+
+
         while True:
             msg = load_json_string(websocket.recv());
-            print(json.dumps(msg, indent=4))
+            # print(json.dumps(msg, indent=4))
 
             match(msg['event']):
                 case "ATTENDANCE_STARTED":
-                    print("-- ATTENDANCE STARTED --")
+                    format_print(course_id, "-- ATTENDANCE STARTED --")
                     join_class(course_id)
                 case "question":
-                    print("-- QUESTION STARTED --")
+                    format_print(course_id, "-- QUESTION STARTED --")
                     activity_id = msg['data']['activityId']
                     question_id = msg['data']['questionId']
                     answer_type = msg['data']['answerType']
                     # question_handler_thread = StoppableThread(target=asyncio.run, args=(handle_question(activity_id, question_id),))
                     question_handler_thread = QuestionThread(course_id, activity_id, question_id, answer_type)
-
                     question_handler_thread.start()
                 case "endQuestion":
-                    print("-- QUESTION ENDED --")
+                    format_print(course_id, "-- QUESTION ENDED --")
                     if question_handler_thread != None:
                         question_handler_thread.stop()
                         question_handler_thread = None
                 case "MEETING_ENDED":
-                    print("-- MEETING ENDED --")
+                    format_print(course_id, "-- MEETING ENDED --")
                     if question_handler_thread != None:
                         question_handler_thread.stop()
                         question_handler_thread = None
 
-asyncio.run(main(COURSE_ID))
+async def main():
+    globals()['USER_ID'] = requests.get(PROFILE_ENDPOINT, headers=HEADERS).json()['userid']
+    print(f"USER_ID is {USER_ID}")
+
+    get_courses = requests.get(generate_endpoint(COURSES_ENDPOINT, { "userId": USER_ID }), headers=HEADERS)
+    
+    course_ids = []
+    for enrollment in get_courses.json()['enrollments']:
+        course_ids.append(enrollment['courseId'])
+    print(f"course ids: {course_ids}")
+
+    for course_id in course_ids:
+        thread = threading.Thread(target=asyncio.run, args=(handle_course(course_id),))
+        thread.start()
+    # await handle_course(COURSE_ID)
+
+asyncio.run(main())
