@@ -35,6 +35,7 @@ HEADERS = { "Authorization": AUTH_TOKEN }
 
 ENDPOINT_TEMPLATE_OPTIONS = ['courseId', 'cluster', 'clusterKey', 'activityId', 'questionId', 'userQuestionId', 'userId']
 
+UPDATE_ANSWER_TIME_SECONDS = 2
 VALID_ANSWER_PERCENTAGE_THRESHOLD = 60
 
 def format_print(course_id, message):
@@ -99,11 +100,11 @@ class QuestionThread(StoppableThread):
         # answer automatically
         post_answer = requests.post(post_answer_endpoint, json=post_json_data, headers=HEADERS)
         if post_answer.status_code != 200:
-            if post_answer.status_code == 409:
-                format_print(course_id, "WARNING: answer_question status code is 409. It's likely that the question has already been answered.")
+            if post_answer.status_code == 409 and "UserQuestion already exists." == post_answer.json()['message']:
+                format_print(course_id, "Question has already been answered.")
             else:
                 format_print(course_id, "ERROR: answer_question status code is " + str(post_answer.status_code))
-            format_print(course_id, "Stopping question handler (wouldn't have userQuestionId)...")
+            format_print(course_id, "Stopping question handler (can't update without userQuestionId)...")
             return
         else:
             format_print(course_id, "Successfully answered question.")
@@ -114,7 +115,7 @@ class QuestionThread(StoppableThread):
         put_json_data = add_default_answer(put_json_data, answer_key)
 
         while not self.stopped():
-            await asyncio.sleep(1)
+            await asyncio.sleep(UPDATE_ANSWER_TIME_SECONDS)
             if self.stopped():
                 break
 
@@ -176,9 +177,36 @@ def load_json_string(json_string):
 def join_class(course_id):
     """attempts to join the class with the given course_id"""
     format_print(course_id, f"Attempting to join course ({course_id})...")
-    join_course = requests.post(generate_endpoint(JOIN_CLASS_ENDPOINT_TEMPLATE, options={ "courseId": course_id}), headers=HEADERS)
-    format_print(course_id, "join course response: " + str(join_course))
-    return join_course.status_code
+    post_join = requests.post(generate_endpoint(JOIN_CLASS_ENDPOINT_TEMPLATE, options={ "courseId": course_id}),json={ "id": course_id, "geo": {"lat":1.0,"lon":1.0}}, headers=HEADERS)
+
+    is_present = post_join.status_code == 200 and 'result' in post_join.json() and post_join.json()['result'] == "PRESENT"
+    is_no_class = post_join.status_code == 409 and "There is no active Attendance." in post_join.json()['error']['desc']
+    is_location_error = post_join.status_code == 200 and 'method' in post_join.json() and post_join.json()['method'] == "GEO"
+
+    if is_present:
+        format_print(course_id, "Successfully joined class.")
+    elif is_no_class:
+        format_print(course_id, "No active attendance, did not join.")
+    elif not is_location_error:
+        format_print(course_id, "ERROR: join course failed with response: " + str(post_join.content))
+
+    if not is_location_error:
+        return post_join.status_code
+
+    # resolve location error
+    format_print(course_id, "Class requires location. Attempting to join again...")
+    post_join = requests.post(generate_endpoint(JOIN_CLASS_ENDPOINT_TEMPLATE, options={ "courseId": course_id}),json={ "id": course_id, "geo": post_join.json()['instructorLocation'] }, headers=HEADERS)
+
+    if post_join.status_code == 200 and 'result' in post_join.json() and post_join.json()['result'] == "PRESENT":
+        format_print(course_id, "Successfully spoofed location and joined class.")
+    else:
+        format_print(course_id, f"ERROR: join course failed with response: {post_join.content}")
+
+    return post_join.status_code
+
+
+
+    return post_join.status_code
 
 async def handle_course(course_id):
     # try joining at the start just in case class has already started.
@@ -211,10 +239,12 @@ async def handle_course(course_id):
         # attempt to join current activity if the class is already active.
         if join_class_status == 200:
             get_classes = requests.get(generate_endpoint(CLASS_SECTIONS_ENDPOINT, options={ "courseId": course_id, "userId": USER_ID }), headers=HEADERS)
-            most_recent_question = get_classes.json()[0]['activities'][-1]['questions'][-1]
+            most_recent_activities = get_classes.json()[0]['activities']
+            if len(most_recent_activities) > 0:
+                most_recent_question = most_recent_activities[-1]['questions'][-1]
 
-            question_handler_thread = QuestionThread(course_id, most_recent_question['activityId'], most_recent_question['_id'], most_recent_question['answerType'])
-            question_handler_thread.start()
+                question_handler_thread = QuestionThread(course_id, most_recent_question['activityId'], most_recent_question['_id'], most_recent_question['answerType'])
+                question_handler_thread.start()
 
 
         while True:
