@@ -26,12 +26,11 @@ PUT_ANSWER_ENDPOINT_TEMPLATE = API_URL + "/v2/activities/{activityId}/questions/
 
 GET_QUESTIONS_ENDPOINT_TEMPLATE = API_URL + "/v2/reporting/courses/{courseId}/activities/{activityId}/questions/view"
 
-COURSE_ID = SETTINGS['courseId']
 AUTH_TOKEN = SETTINGS['authToken']
 # initially unset. Get's pulled from server
 USER_ID = None
 
-HEADERS = { "Authorization": AUTH_TOKEN }
+HEADERS = { "Authorization": f"Bearer {AUTH_TOKEN}" }
 
 ENDPOINT_TEMPLATE_OPTIONS = ['courseId', 'cluster', 'clusterKey', 'activityId', 'questionId', 'userQuestionId', 'userId']
 
@@ -291,4 +290,7 @@ async def main():
         thread.start()
     # await handle_course(COURSE_ID)
 
-asyncio.run(main())
+if AUTH_TOKEN == "your token here":
+    print("Copy a valid auth token into settings.json")
+else:
+    asyncio.run(main())
