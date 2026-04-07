@@ -3,6 +3,7 @@ import json
 
 import threading
 import asyncio
+from requests.api import get
 from websockets.sync.client import connect
 
 SETTINGS = json.load(open("settings.json"))
@@ -13,7 +14,10 @@ PROFILE_ENDPOINT = API_URL + "/trogon/v4/profile"
 COURSES_ENDPOINT = API_URL + "/v1/users/{userId}/views/student-courses"
 CLASS_SECTIONS_ENDPOINT = API_URL + "/v2/courses/{courseId}/class-sections?recordsPerPage=1&pageNumber=1&expandChild=activities&expandChild=userActivities&expandChild=attendances&expandChild=questions&expandChild=userQuestions&expandChild=questionGroups&userId={userId}"
 
+COURSE_STATUS_ENDPOINT = API_URL + "/student/course/status"
+
 JOIN_CLASS_ENDPOINT_TEMPLATE = API_URL + "/trogon/v2/course/attendance/join/{courseId}"
+JOIN_CLASS_V1_ENDPOINT_TEMPLATE = API_URL + "/v1/meetings/{meetingId}/join-participant"
 
 GET_PUSHER_CLUSTER_ENDPOINT = API_URL + "/v1/settings/pusher-cluster-primary/value"
 
@@ -32,7 +36,9 @@ USER_ID = None
 
 HEADERS = { "Authorization": f"Bearer {AUTH_TOKEN}" }
 
-ENDPOINT_TEMPLATE_OPTIONS = ['courseId', 'cluster', 'clusterKey', 'activityId', 'questionId', 'userQuestionId', 'userId']
+ENDPOINT_TEMPLATE_OPTIONS = ['courseId', 'cluster', 'clusterKey', 'activityId', 'questionId', 'userQuestionId', 'userId', 'meetingId' ]
+
+COURSE_ID_TO_ENROLLMENT_ID = {}
 
 UPDATE_ANSWER_TIME_SECONDS = 2
 VALID_ANSWER_PERCENTAGE_THRESHOLD = 60
@@ -54,21 +60,15 @@ class StoppableThread(threading.Thread):
     def stopped(self):
         return self._stop_event.is_set()
 
-def answer_type_to_key(answerType: str) -> str | None:
-    match(answerType):
-        case "SINGLE_ANSWER":
-            return "answer"
-        case "MULTIPLE_ANSWER":
-            return "answers"
-    return None
+ANSWER_TYPE_TO_KEY = { "SINGLE_ANSWER": "answer", "MULTIPLE_ANSWER": "answers" }
 
 def add_default_answer(data, answer_key):
-        match(answer_key):
-            case "answer":
-                data[answer_key] = "A"
-            case "answers":
-                data[answer_key] = ["A"]
-        return data
+    if answer_key == "answer":
+        data[answer_key] = "A"
+    if answer_key == "answers":
+        data[answer_key] = ["A"]
+
+    return data
 
 class QuestionThread(StoppableThread):
     def __init__(self, course_id, activity_id, question_id, answer_type="SINGLE_ANSWER"):
@@ -89,7 +89,7 @@ class QuestionThread(StoppableThread):
         post_json_data = { "userId": USER_ID, "activityId": activity_id, "questionId": question_id, "clientType": "WEB" }
 
         # handle different requests for different question types
-        answer_key = answer_type_to_key(answer_type)
+        answer_key = ANSWER_TYPE_TO_KEY.get(answer_type)
         if answer_key == None:
             format_print(course_id, "invalid or unanswerable answer type")
             return
@@ -103,7 +103,7 @@ class QuestionThread(StoppableThread):
                 format_print(course_id, "Question has already been answered.")
             else:
                 format_print(course_id, "ERROR: answer_question status code is " + str(post_answer.status_code))
-            format_print(course_id, "Stopping question handler (can't update without userQuestionId)...")
+            format_print(course_id, "Stopping question handler...")
             return
         else:
             format_print(course_id, "Successfully answered question.")
@@ -132,20 +132,19 @@ class QuestionThread(StoppableThread):
                 if answer['percentageOfTotalResponses'] > VALID_ANSWER_PERCENTAGE_THRESHOLD:
                     valid_answers.append(answer['answer'])
 
-            match(answer_key):
-                case "answer":
-                    if (put_json_data['answer'] == best_answer['answer']):
-                        continue
+            if (answer_key == "answer"):
+                if (put_json_data['answer'] == best_answer['answer']):
+                    continue
 
-                    format_print(course_id, f"changing answer to {best_answer['answer']}...")
-                    put_json_data[answer_key] = best_answer['answer']
+                format_print(course_id, f"changing answer to {best_answer['answer']}...")
+                put_json_data[answer_key] = best_answer['answer']
 
-                case "answers":
-                    if (put_json_data['answers'] == valid_answers):
-                        continue
+            elif (answer_key == "answers"):
+                if (put_json_data['answers'] == valid_answers):
+                    continue
 
-                    format_print(course_id, f"changing answer to {valid_answers}...")
-                    put_json_data[answer_key] = valid_answers
+                format_print(course_id, f"changing answer to {valid_answers}...")
+                put_json_data[answer_key] = valid_answers
 
 
             put_answer = requests.put(put_answer_endpoint, json=put_json_data, headers=HEADERS)
@@ -173,9 +172,9 @@ def load_json_string(json_string):
         res['data'] = json.loads(res['data'])
     return res;
 
-def join_class(course_id):
+def join_class(course_id) -> bool:
     """attempts to join the class with the given course_id"""
-    format_print(course_id, f"Attempting to join course ({course_id})...")
+    format_print(course_id, f"Attempting to join course ({course_id[:5]})...")
     post_join = requests.post(generate_endpoint(JOIN_CLASS_ENDPOINT_TEMPLATE, options={ "courseId": course_id}),json={ "id": course_id, "geo": {"lat":1.0,"lon":1.0}}, headers=HEADERS)
 
     is_present = post_join.status_code == 200 and 'result' in post_join.json() and post_join.json()['result'] == "PRESENT"
@@ -184,13 +183,16 @@ def join_class(course_id):
 
     if is_present:
         format_print(course_id, "Successfully joined class.")
+        return True
     elif is_no_class:
-        format_print(course_id, "No active attendance, did not join.")
+        format_print(course_id, "No active attendance found, did not join.")
+        # since classes that use v1 of the api, it will return as if there is no active attendance.
+        return join_class_v1(course_id);
     elif not is_location_error:
         format_print(course_id, "ERROR: join course failed with response: " + str(post_join.content))
 
     if not is_location_error:
-        return post_join.status_code
+        return False
 
     # resolve location error
     format_print(course_id, "Class requires location. Attempting to join again...")
@@ -198,18 +200,34 @@ def join_class(course_id):
 
     if post_join.status_code == 200 and 'result' in post_join.json() and post_join.json()['result'] == "PRESENT":
         format_print(course_id, "Successfully spoofed location and joined class.")
+        return True
     else:
         format_print(course_id, f"ERROR: join course failed with response: {post_join.content}")
 
-    return post_join.status_code
+    return False
 
+def join_class_v1(course_id) -> bool:
+    format_print(course_id, f"(v1) Attempting to join course ({course_id[:5]}) with  v1 api...")
 
+    get_course_status = requests.post(COURSE_STATUS_ENDPOINT, json={"courseId": course_id}, headers=HEADERS)
+    meeting_id = get_course_status.json()['meetingId']
+    if meeting_id == None:
+        format_print(course_id, "(v1) No active attendance found, did not join.")
+        return False
 
-    return post_join.status_code
+    post_join_v1 = requests.post(generate_endpoint(JOIN_CLASS_V1_ENDPOINT_TEMPLATE, options={ 'meetingId': meeting_id }), json={ "meetingId": meeting_id, "enrollmentId": COURSE_ID_TO_ENROLLMENT_ID[course_id] }, headers=HEADERS)
+
+    if post_join_v1.status_code == 200 and 'joined' in post_join_v1.json() and post_join_v1.json()['joined'] != None:
+        format_print(course_id, "(v1) Successfully joined class.")
+        return True
+    else:
+        format_print(course_id, f"ERROR: (v1) join course failed with code {post_join_v1.status_code} and content {post_join_v1.content}")
+    return False
+
 
 async def handle_course(course_id):
     # try joining at the start just in case class has already started.
-    join_class_status = join_class(course_id);
+    join_class_successful = join_class(course_id);
 
     get_pusher_cluster = requests.get(GET_PUSHER_CLUSTER_ENDPOINT, headers=HEADERS)
     format_print(course_id, "get pusher cluster response: " + str(get_pusher_cluster))
@@ -234,9 +252,9 @@ async def handle_course(course_id):
         websocket.send(f'{{"event":"pusher:subscribe","data":{{"auth":"{channel_auth_token}","channel":"private-{course_id}"}}}}')
 
         question_handler_thread = None
-
+ 
         # attempt to join current activity if the class is already active.
-        if join_class_status == 200:
+        if join_class_successful:
             get_classes = requests.get(generate_endpoint(CLASS_SECTIONS_ENDPOINT, options={ "courseId": course_id, "userId": USER_ID }), headers=HEADERS)
             most_recent_activities = get_classes.json()[0]['activities']
             if len(most_recent_activities) > 0:
@@ -250,28 +268,27 @@ async def handle_course(course_id):
             msg = load_json_string(websocket.recv());
             # print(json.dumps(msg, indent=4))
 
-            match(msg['event']):
-                case "ATTENDANCE_STARTED":
-                    format_print(course_id, "-- ATTENDANCE STARTED --")
-                    join_class(course_id)
-                case "question":
-                    format_print(course_id, "-- QUESTION STARTED --")
-                    activity_id = msg['data']['activityId']
-                    question_id = msg['data']['questionId']
-                    answer_type = msg['data']['answerType']
-                    # question_handler_thread = StoppableThread(target=asyncio.run, args=(handle_question(activity_id, question_id),))
-                    question_handler_thread = QuestionThread(course_id, activity_id, question_id, answer_type)
-                    question_handler_thread.start()
-                case "endQuestion":
-                    format_print(course_id, "-- QUESTION ENDED --")
-                    if question_handler_thread != None:
-                        question_handler_thread.stop()
-                        question_handler_thread = None
-                case "MEETING_ENDED":
-                    format_print(course_id, "-- MEETING ENDED --")
-                    if question_handler_thread != None:
-                        question_handler_thread.stop()
-                        question_handler_thread = None
+            if msg['event'] == "ATTENDANCE_STARTED":
+                format_print(course_id, "-- ATTENDANCE STARTED --")
+                join_class(course_id)
+            if msg['event'] ==  "question":
+                format_print(course_id, "-- QUESTION STARTED --")
+                activity_id = msg['data']['activityId']
+                question_id = msg['data']['questionId']
+                answer_type = msg['data']['answerType']
+                # question_handler_thread = StoppableThread(target=asyncio.run, args=(handle_question(activity_id, question_id),))
+                question_handler_thread = QuestionThread(course_id, activity_id, question_id, answer_type)
+                question_handler_thread.start()
+            if msg['event'] == "endQuestion":
+                format_print(course_id, "-- QUESTION ENDED --")
+                if question_handler_thread != None:
+                    question_handler_thread.stop()
+                    question_handler_thread = None
+            if msg['event'] == "MEETING_ENDED":
+                format_print(course_id, "-- MEETING ENDED --")
+                if question_handler_thread != None:
+                    question_handler_thread.stop()
+                    question_handler_thread = None
 
 async def main():
     globals()['USER_ID'] = requests.get(PROFILE_ENDPOINT, headers=HEADERS).json()['userid']
@@ -283,6 +300,7 @@ async def main():
     for enrollment in get_courses.json()['enrollments']:
         if enrollment['archived'] == None:
             course_ids.append(enrollment['courseId'])
+            globals()['COURSE_ID_TO_ENROLLMENT_ID'][enrollment['courseId']] = enrollment['enrollmentId']
     print(f"course ids: {course_ids}")
 
     for course_id in course_ids:
