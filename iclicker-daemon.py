@@ -43,6 +43,8 @@ COURSE_ID_TO_ENROLLMENT_ID = {}
 UPDATE_ANSWER_TIME_SECONDS = 2
 VALID_ANSWER_PERCENTAGE_THRESHOLD = 60
 
+JOINED_MEETINGS = {}
+
 def format_print(course_id, message):
     print(f"[{course_id[:5]}] {message}")
 
@@ -271,6 +273,19 @@ async def handle_course(course_id):
             if msg['event'] == "ATTENDANCE_STARTED":
                 format_print(course_id, "-- ATTENDANCE STARTED --")
                 join_class(course_id)
+            # backup joining in case socket doesn't send out ATTENDANCE_STARTED event for some reason. Feels better than pinging.
+            if msg['event'] == "PARTICIPANT_JOINED":
+                if msg['data']['enrollmentId'] == COURSE_ID_TO_ENROLLMENT_ID[course_id]:
+                    JOINED_MEETINGS[msg['data']['meetingId']] = True
+                    continue
+
+                if msg['data']['meetingId']  in JOINED_MEETINGS:
+                    continue
+
+                format_print(course_id, "-- PARTICIPANT JOINED (currently unjoined)--")
+                join_class(course_id)
+                JOINED_MEETINGS[msg['data']['meetingId']] = True
+
             if msg['event'] ==  "question":
                 format_print(course_id, "-- QUESTION STARTED --")
                 activity_id = msg['data']['activityId']
